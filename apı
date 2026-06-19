@@ -1,0 +1,8 @@
+import google.generativeai as genai
+
+def get_ai_suggestions(text, missing_sections, score, api_key):
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel('gemini-pro')
+    prompt = f"... (aynı prompt)"  # prompt aynı kalabilir
+    response = model.generate_content(prompt)
+    return response.text
