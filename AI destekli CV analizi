@@ -1,0 +1,329 @@
+import streamlit as st
+import pandas as pd
+import re
+import io
+import base64
+from pypdf import PdfReader
+from openai import OpenAI
+from docx import Document
+from docx.shared import Pt
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+# -------------------- SAYFA YAPILANDIRMASI --------------------
+st.set_page_config(
+    page_title="AI Destekli CV Analiz Sistemi",
+    page_icon="",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# -------------------- YAN SIDEBAR (API AYARI) --------------------
+with st.sidebar:
+    st.image("https://img.icons8.com/fluency/96/000000/resume.png", width=80)
+    st.title(" Ayarlar")
+    openai_api_key = st.text_input(
+        "OpenAI API Anahtarınız",
+        type="password",
+        placeholder="sk-...",
+        help="OpenAI API anahtarınızı girin. [Buradan alabilirsiniz](https://platform.openai.com/api-keys)"
+    )
+    st.markdown("---")
+    st.caption(" Sistem, CV'nizi analiz eder, ATS skorunu hesaplar ve iyileştirme önerileri sunar.")
+    st.caption(" Bonus: ATS uyumlu Word belgesi oluşturur.")
+
+# -------------------- SABİTLER ve YARDIMCI FONKSİYONLAR --------------------
+# Yetenek listesi (kategorilere ayrılmış)
+SKILLS_DB = {
+    "Programlama Dilleri": ["python", "java", "c++", "c#", "javascript", "typescript", "go", "rust", "swift", "kotlin", "php", "r", "matlab"],
+    "Veri Bilimi & ML": ["tensorflow", "pytorch", "scikit-learn", "pandas", "numpy", "matplotlib", "seaborn", "opencv", "nlp", "deep learning", "machine learning", "yapay zeka", "veri bilimi"],
+    "Web & Mobil": ["react", "angular", "vue", "node.js", "django", "flask", "spring boot", "asp.net", "html", "css", "bootstrap", "flutter", "react native"],
+    "Veritabanı": ["sql", "mysql", "postgresql", "mongodb", "oracle", "redis", "elasticsearch", "cassandra"],
+    "Bulut & DevOps": ["aws", "azure", "gcp", "docker", "kubernetes", "jenkins", "git", "github", "gitlab", "ci/cd", "terraform", "ansible"],
+    "Sistem & Ağ": ["linux", "unix", "windows server", "network", "security", "firewall", "tcp/ip"],
+    "Sertifikalar": ["scrum", "agile", "pmp", "itil", "cissp", "ceh", "comptia"]
+}
+FLAT_SKILLS = [skill.lower() for skills in SKILLS_DB.values() for skill in skills]
+
+def extract_text_from_pdf(uploaded_file):
+    """PDF'den metin çıkarır."""
+    try:
+        reader = PdfReader(uploaded_file)
+        text = ""
+        for page in reader.pages:
+            extracted = page.extract_text()
+            if extracted:
+                text += extracted + "\n"
+        return text.strip()
+    except Exception as e:
+        st.error(f"PDF okunurken hata oluştu: {e}")
+        return ""
+
+def analyze_cv(text):
+    """CV metnini analiz eder: bölümler, skor, yetenekler."""
+    if not text:
+        return None, None, None, None
+
+    text_lower = text.lower()
+    words = text.split()
+    word_count = len(words)
+
+    # 1. Bölüm tespiti (Regex ile)
+    sections = {
+        "summary": bool(re.search(r'\b(özet|profil|hakkımda|summary|profile)\b', text_lower)),
+        "education": bool(re.search(r'\b(eğitim|okul|üniversite|fakülte|education|university|college)\b', text_lower)),
+        "experience": bool(re.search(r'\b(deneyim|iş tecrübesi|çalıştığı|experience|work|employment)\b', text_lower)),
+        "skills": bool(re.search(r'\b(yetenek|beceri|skills|competencies|teknoloji|programlama)\b', text_lower)),
+        "projects": bool(re.search(r'\b(proje|geliştirdi|tasarladı|project|development)\b', text_lower)),
+        "certifications": bool(re.search(r'\b(sertifika|certification|belge|course)\b', text_lower)),
+        "contact": bool(re.search(r'[\w\.-]+@[\w\.-]+\.\w+', text))  # email kontrolü
+    }
+
+    missing_sections = [sec for sec, val in sections.items() if not val]
+
+    # 2. ATS Skoru Hesaplama (0-100)
+    score = 0
+    # İletişim (Email + Telefon varsa)
+    if sections["contact"]:
+        score += 15
+    if re.search(r'(\d{10,15}|\+\d{1,4}\s?\d{10,15})', text):  # telefon
+        score += 5  # toplam 20 (email+telefon)
+    else:
+        score += 10  # sadece email varsa
+
+    if sections["summary"]: score += 10
+    if sections["education"]: score += 15
+    if sections["experience"]: score += 15
+    if sections["skills"]: score += 20
+    if sections["projects"]: score += 5
+    if sections["certifications"]: score += 5
+
+    # Kelime uzunluğu (ATS için ideal 300-800 kelime)
+    if 300 <= word_count <= 800:
+        score += 10
+    elif 200 <= word_count < 300 or 800 < word_count <= 1200:
+        score += 5
+    else:
+        score += 0
+
+    # Anahtar kelime zenginliği (sektörel terimler)
+    keyword_pattern = r'\b(başarı|yönetti|geliştirdi|tasarladı|analiz|rapor|ekip|proje|strateji|çözüm|leadership|managed|developed|analyzed|team|project|solution)\b'
+    keywords = re.findall(keyword_pattern, text_lower)
+    keyword_score = min(len(keywords) * 2, 10)  # max 10 puan
+    score += keyword_score
+
+    # Maksimum 100'ü geçmesin
+    score = min(score, 100)
+
+    # 3. Yetenek Analizi
+    found_skills = {}
+    for category, skills in SKILLS_DB.items():
+        matched = []
+        for skill in skills:
+            if re.search(rf'\b{re.escape(skill)}\b', text_lower):
+                matched.append(skill.title())
+        if matched:
+            found_skills[category] = matched
+
+    # 4. Özet istatistikler
+    stats = {
+        "word_count": word_count,
+        "has_contact": sections["contact"],
+        "has_summary": sections["summary"],
+        "has_education": sections["education"],
+        "has_experience": sections["experience"],
+        "has_skills": sections["skills"]
+    }
+
+    return score, missing_sections, found_skills, stats
+
+def get_ai_suggestions(text, missing_sections, score, api_key):
+    """OpenAI API kullanarak iyileştirme önerileri alır."""
+    if not api_key:
+        return "⚠️ Lütfen geçerli bir OpenAI API anahtarı girin."
+
+    missing_text = ", ".join(missing_sections) if missing_sections else "Hiçbir bölüm eksik değil, tebrikler!"
+    prompt = f"""Sen bir kariyer koçu ve ATS uzmanısın. Aşağıda verilen CV metnini analiz et.
+
+ATS Skoru: {score}/100
+Eksik Bölümler: {missing_text}
+
+CV Metni:
+{text[:6000]}  # Token sınırı için ilk 6000 karakter
+
+Lütfen şu 5 başlık altında Türkçe öneriler sun:
+1.  Eksik Bölümler İçin Öneriler
+2.  Beceri Geliştirme Tavsiyeleri
+3.  İfade ve Dil Kullanımı (Daha güçlü fiiller, başarı odaklı cümleler)
+4.  Format ve Düzen (ATS dostu yapı)
+5.  Genel Stratejik Tavsiyeler
+
+Her başlık altında 2-3 somut, uygulanabilir madde olsun. Cümleler net ve profesyonel olsun.
+"""
+    try:
+        client = OpenAI(api_key=api_key)
+        response = client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "Sen deneyimli bir kariyer danışmanısın."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.7,
+            max_tokens=800
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        return f" API hatası: {e}"
+
+def generate_ats_cv(text, title="CV"):
+    """Verilen metni kullanarak ATS uyumlu Word belgesi oluşturur."""
+    doc = Document()
+    # Başlık
+    title_para = doc.add_heading(title, level=1)
+    title_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    # Metni temizle ve satırlara böl
+    lines = text.split('\n')
+    for line in lines:
+        line = line.strip()
+        if not line:
+            doc.add_paragraph()  # Boş satır
+        elif re.match(r'^[A-ZÇĞİÖŞÜ\s]{2,}$', line) and len(line) < 60:  # Büyük harfli başlık gibi
+            doc.add_heading(line, level=2)
+        elif re.match(r'^[\d]{1,2}\.?[\s]?.*', line):  # Numara ile başlayan liste
+            doc.add_paragraph(line, style='List Bullet')
+        else:
+            p = doc.add_paragraph(line)
+            p.paragraph_format.space_after = Pt(6)
+
+    # ATS uyumlu font ayarları (tüm belge için)
+    style = doc.styles['Normal']
+    style.font.name = 'Times New Roman'
+    style.font.size = Pt(12)
+
+    # Bellekteki dosyayı oluştur
+    file_stream = io.BytesIO()
+    doc.save(file_stream)
+    file_stream.seek(0)
+    return file_stream
+
+def get_download_link(file_stream, filename):
+    """Word dosyası için indirme bağlantısı oluşturur."""
+    b64 = base64.b64encode(file_stream.read()).decode()
+    href = f'<a href="data:application/vnd.openxmlformats-officedocument.wordprocessingml.document;base64,{b64}" download="{filename}">📥 {filename}</a>'
+    return href
+
+# -------------------- ANA UYGULAMA --------------------
+st.markdown("<h1 style='text-align: center;'> AI Destekli CV Analiz Sistemi</h1>", unsafe_allow_html=True)
+st.markdown("<p style='text-align: center; font-size: 18px;'>PDF CV'nizi yükleyin, ATS skorunuzu görün, eksiklerinizi tespit edin ve yapay zeka ile iyileştirin.</p>", unsafe_allow_html=True)
+st.divider()
+
+# Dosya yükleme
+uploaded_file = st.file_uploader(" CV'nizi PDF formatında yükleyin", type=["pdf"], accept_multiple_files=False)
+
+if uploaded_file is not None:
+    # PDF'den metin çıkar
+    with st.spinner(" PDF okunuyor ve metin çıkarılıyor..."):
+        cv_text = extract_text_from_pdf(uploaded_file)
+
+    if not cv_text:
+        st.error(" PDF'den metin çıkarılamadı. Lütfen dosyanın metin içerdiğinden emin olun.")
+        st.stop()
+
+    # Analiz yap
+    with st.spinner(" CV analiz ediliyor (ATS Skoru, Bölümler, Beceriler)..."):
+        score, missing, skills, stats = analyze_cv(cv_text)
+
+    if score is None:
+        st.error(" Analiz sırasında bir hata oluştu.")
+        st.stop()
+
+    # --- SONUÇLARI GÖSTER ---
+    col1, col2 = st.columns([2, 1])
+
+    with col1:
+        st.subheader(" Çıkarılan Metin (Önizleme)")
+        with st.expander("CV Metnini Göster", expanded=False):
+            st.text(cv_text[:3000] + ("..." if len(cv_text) > 3000 else ""))
+
+    with col2:
+        st.subheader(" ATS Uyumluluk Skoru")
+        # Renkli gösterim
+        if score >= 80:
+            color = "green"
+            emoji = "🟢"
+            msg = "Mükemmel! ATS uyumluluğu yüksek."
+        elif score >= 60:
+            color = "orange"
+            emoji = "🟡"
+            msg = "İyi, ama geliştirilebilir."
+        else:
+            color = "red"
+            emoji = "🔴"
+            msg = "Düşük, önerileri dikkate almalısın."
+
+        st.markdown(f"<h1 style='text-align: center; color:{color};'>{score}/100</h1>", unsafe_allow_html=True)
+        st.markdown(f"<p style='text-align: center;'>{emoji} {msg}</p>", unsafe_allow_html=True)
+
+        # Detaylı istatistikler
+        st.caption(f" Kelime Sayısı: {stats['word_count']} (İdeal: 300-800)")
+        st.caption(f" İletişim: {'Var' if stats['has_contact'] else ' Eksik'}")
+        st.caption(f" Özet: {' Var' if stats['has_summary'] else ' Eksik'}")
+        st.caption(f" Eğitim: {' Var' if stats['has_education'] else ' Eksik'}")
+        st.caption(f" Deneyim: {' Var' if stats['has_experience'] else ' Eksik'}")
+        st.caption(f" Yetenekler: {' Var' if stats['has_skills'] else ' Eksik'}")
+
+    st.divider()
+
+    # Eksik Bölümler ve Beceri Analizi
+    col3, col4 = st.columns(2)
+
+    with col3:
+        st.subheader(" Tespit Edilen Eksik Bölümler")
+        if missing:
+            for miss in missing:
+                st.warning(f"- {miss.replace('_', ' ').title()}")
+            st.info(" Bu bölümleri eklemek skorunu artıracaktır.")
+        else:
+            st.success(" Tüm kritik bölümler mevcut!")
+
+    with col4:
+        st.subheader(" Beceri Analizi")
+        if skills:
+            skill_df = pd.DataFrame([(cat, ", ".join(skills)) for cat, skills in skills.items()],
+                                    columns=["Kategori", "Tespit Edilen Beceriler"])
+            st.dataframe(skill_df, use_container_width=True, hide_index=True)
+        else:
+            st.warning(" Hiç beceri tespit edilemedi. Lütfen teknik yeteneklerinizi listeleyin.")
+
+    st.divider()
+
+    # --- AI ÖNERİLERİ ---
+    st.subheader(" Yapay Zeka ile İyileştirme Önerileri")
+    if st.button(" AI Önerilerini Getir", use_container_width=True):
+        if not openai_api_key:
+            st.error(" Lütfen yan menüden OpenAI API anahtarınızı girin.")
+        else:
+            with st.spinner(" AI düşünüyor, lütfen bekleyin..."):
+                suggestions = get_ai_suggestions(cv_text, missing, score, openai_api_key)
+            st.markdown(suggestions)
+
+    st.divider()
+
+    # --- BONUS: ATS UYUMLU CV OLUŞTUR ---
+    st.subheader(" Bonus: ATS Uyumlu CV Oluştur")
+    st.markdown("Tek sütun, sade font ve standart yapıda Word dosyası oluşturur. İş başvurularında gönül rahatlığıyla kullanabilirsiniz.")
+
+    if st.button(" ATS Uyumlu CV'yi İndir", use_container_width=True):
+        with st.spinner(" ATS uyumlu Word belgesi oluşturuluyor..."):
+            doc_stream = generate_ats_cv(cv_text, title="ATS Uyumlu CV")
+            href = get_download_link(doc_stream, "ATS_Uyumlu_CV.docx")
+            st.markdown(href, unsafe_allow_html=True)
+            st.success(" Belge hazır! Yukarıdaki bağlantıya tıklayarak indirin.")
+
+    st.divider()
+    st.caption(" Bu proje, bilgisayar mühendisliği öğrencisi portföyü için tasarlanmıştır. | Streamlit + OpenAI")
+
+else:
+    # Dosya yüklenmemişse hoş geldin mesajı
+    st.info("Soldaki menüden API anahtarınızı girmeyi unutmayın. Ardından yukarıdan PDF CV'nizi yükleyin.")
+    st.image("https://cdn-icons-png.flaticon.com/512/3135/3135715.png", width=150)
